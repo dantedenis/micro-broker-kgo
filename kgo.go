@@ -468,14 +468,30 @@ func (b *Broker) Subscribe(ctx context.Context, topic string, handler broker.Han
 		}
 	}
 
+	commitOnRevoke := true
+	if b.opts.Context != nil {
+		if v, ok := b.opts.Context.Value(commitOnRevokeKey{}).(bool); ok {
+			commitOnRevoke = v
+		}
+	}
+
+	var onRevoke func()
+	if b.opts.Context != nil {
+		if v, ok := b.opts.Context.Value(onRevokeKey{}).(func()); ok {
+			onRevoke = v
+		}
+	}
+
 	sub := &Subscriber{
-		topic:        topic,
-		opts:         options,
-		handler:      handler,
-		kopts:        b.opts,
-		done:         make(chan struct{}),
-		fatalOnError: fatalOnError,
-		connected:    b.connected,
+		topic:          topic,
+		opts:           options,
+		handler:        handler,
+		kopts:          b.opts,
+		done:           make(chan struct{}),
+		fatalOnError:   fatalOnError,
+		commitOnRevoke: commitOnRevoke,
+		onRevoke:       onRevoke,
+		connected:      b.connected,
 	}
 	sub.initConsumers()
 

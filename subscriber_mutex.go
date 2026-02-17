@@ -26,8 +26,10 @@ type Subscriber struct {
 	kopts broker.Options
 	opts  broker.SubscribeOptions
 
-	closed       atomic.Bool
-	fatalOnError bool
+	closed         atomic.Bool
+	fatalOnError   bool
+	commitOnRevoke bool
+	onRevoke       func()
 
 	mu sync.RWMutex
 }
