@@ -40,7 +40,8 @@ type consumer struct {
 	kopts broker.Options
 	opts  broker.SubscribeOptions
 
-	partition int32
+	partition    int32
+	manualCommit bool
 }
 
 func (s *Subscriber) Client() *kgo.Client {
@@ -184,6 +185,12 @@ func (s *Subscriber) revoked(ctx context.Context, c *kgo.Client, revoked map[str
 		s.kopts.Logger.Debug(ctx, fmt.Sprintf("[kgo] revoked %#+v", revoked))
 	}
 	s.killConsumers(ctx, revoked)
+	if s.onRevoke != nil {
+		s.onRevoke()
+	}
+	if !s.commitOnRevoke {
+		return
+	}
 	if err := c.CommitMarkedOffsets(ctx); err != nil {
 		tpc := s.copyConsumers()
 		for key, c := range tpc {
@@ -199,23 +206,69 @@ func (s *Subscriber) assigned(_ context.Context, c *kgo.Client, assigned map[str
 		for _, partition := range partitions {
 			ctx, cancel := context.WithCancel(s.kopts.Context)
 			pc := &consumer{
-				c:         c,
-				topic:     topic,
-				partition: partition,
-				htracer:   s.htracer,
-				ctx:       ctx,
-				cancel:    cancel,
-				done:      make(chan struct{}),
-				recs:      make(chan kgo.FetchTopicPartition, 100),
-				handler:   s.handler,
-				kopts:     s.kopts,
-				opts:      s.opts,
-				connected: s.connected,
+				c:            c,
+				topic:        topic,
+				partition:    partition,
+				htracer:      s.htracer,
+				ctx:          ctx,
+				cancel:       cancel,
+				done:         make(chan struct{}),
+				recs:         make(chan kgo.FetchTopicPartition, 100),
+				handler:      s.handler,
+				kopts:        s.kopts,
+				opts:         s.opts,
+				connected:    s.connected,
+				manualCommit: !s.commitOnRevoke,
 			}
 			s.setConsumer(tp{topic, partition}, pc)
 			go pc.consume()
 		}
 	}
+}
+
+// CommitMessages commits offsets for the given messages by extracting
+// topic/partition/offset from message headers (Micro-Topic, Micro-Partition,
+// Micro-Offset). Only the highest offset per partition is committed.
+// Use this with CommitOnRevoke(false) for batch manual commit workflows.
+func (s *Subscriber) CommitMessages(ctx context.Context, msgs ...*broker.Message) error {
+	// Build max offset per topic-partition.
+	type tpOff struct {
+		offset int64
+		epoch  int32
+	}
+	maxOffsets := make(map[string]map[int32]tpOff)
+
+	for _, msg := range msgs {
+		topic, _ := msg.Header.Get("Micro-Topic")
+		offsetStr, _ := msg.Header.Get("Micro-Offset")
+		partStr, _ := msg.Header.Get("Micro-Partition")
+
+		offset, _ := strconv.ParseInt(offsetStr, 10, 64)
+		partition, _ := strconv.ParseInt(partStr, 10, 32)
+
+		p := int32(partition)
+		if _, ok := maxOffsets[topic]; !ok {
+			maxOffsets[topic] = make(map[int32]tpOff)
+		}
+		if cur, ok := maxOffsets[topic][p]; !ok || offset > cur.offset {
+			maxOffsets[topic][p] = tpOff{offset: offset}
+		}
+	}
+
+	// Build synthetic kgo.Records with max offsets and mark+commit.
+	records := make([]*kgo.Record, 0, len(maxOffsets))
+	for topic, parts := range maxOffsets {
+		for partition, off := range parts {
+			records = append(records, &kgo.Record{
+				Topic:     topic,
+				Partition: partition,
+				Offset:    off.offset,
+			})
+		}
+	}
+
+	s.c.MarkCommitRecords(records...)
+	return s.c.CommitMarkedOffsets(ctx)
 }
 
 func (pc *consumer) consume() {
@@ -295,7 +348,9 @@ func (pc *consumer) consume() {
 							_ = eh(p)
 							pc.kopts.Meter.Counter(semconv.SubscribeMessageInflight, "endpoint", record.Topic, "topic", record.Topic).Dec()
 							if p.ack.Load() {
-								pc.c.MarkCommitRecords(record)
+								if !pc.manualCommit {
+									pc.c.MarkCommitRecords(record)
+								}
 							} else {
 								if sp != nil {
 									sp.Finish()
@@ -366,16 +421,22 @@ func (pc *consumer) consume() {
 				pc.kopts.Meter.Histogram(semconv.SubscribeMessageDurationSeconds, "endpoint", record.Topic, "topic", record.Topic).Update(te.Seconds())
 				if p.ack.Load() {
 					eventPool.Put(p)
-					pc.c.MarkCommitRecords(record)
-				} else {
-					eventPool.Put(p)
-					pm := pc.newErrorMessage(ErrLostMessage, record.Topic, record.Partition)
-					_ = pc.handler(pm) // TODO need check
-					if sp != nil {
-						sp.SetStatus(tracer.SpanStatusError, "ErrLostMessage")
-						sp.Finish()
+					if !pc.manualCommit {
+						pc.c.MarkCommitRecords(record)
 					}
-					return
+				} else {
+					if pc.manualCommit {
+						eventPool.Put(p)
+					} else {
+						eventPool.Put(p)
+						pm := pc.newErrorMessage(ErrLostMessage, record.Topic, record.Partition)
+						_ = pc.handler(pm) // TODO need check
+						if sp != nil {
+							sp.SetStatus(tracer.SpanStatusError, "ErrLostMessage")
+							sp.Finish()
+						}
+						return
+					}
 				}
 				if sp != nil {
 					sp.Finish()
@@ -398,10 +459,10 @@ func (pc *consumer) newErrorMessage(err error, t string, p int32) *event {
 	return pm
 }
 
-func (c *consumer) trySend(ftp kgo.FetchTopicPartition) {
+func (pc *consumer) trySend(ftp kgo.FetchTopicPartition) {
 	select {
-	case c.recs <- ftp:
-	case <-c.ctx.Done():
+	case pc.recs <- ftp:
+	case <-pc.ctx.Done():
 	default:
 	}
 }

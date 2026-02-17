@@ -121,6 +121,25 @@ func ClientPublishPromise(fn func(*kgo.Record, error)) client.PublishOption {
 	return client.SetPublishOption(publishPromiseKey{}, fn)
 }
 
+type onRevokeKey struct{}
+
+// OnRevoke sets a callback that is called when partitions are revoked
+// (rebalance or shutdown). Use this to discard in-memory batch buffers
+// that become stale when partitions move to another consumer.
+func OnRevoke(fn func()) broker.Option {
+	return broker.SetOption(onRevokeKey{}, fn)
+}
+
+type commitOnRevokeKey struct{}
+
+// CommitOnRevoke controls whether marked offsets are committed when partitions
+// are revoked (e.g. during rebalance or graceful shutdown). Default is true.
+// Set to false for batch manual commit workflows where uncommitted batches
+// must be re-delivered after a crash (at-least-once semantics).
+func CommitOnRevoke(b bool) broker.Option {
+	return broker.SetOption(commitOnRevokeKey{}, b)
+}
+
 type exposeLagKey struct{}
 
 // ExposeLag enabled subscriber lag via [meter.Meter]
